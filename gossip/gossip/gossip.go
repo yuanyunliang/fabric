@@ -7,7 +7,6 @@ SPDX-License-Identifier: Apache-2.0
 package gossip
 
 import (
-	"crypto/tls"
 	"fmt"
 	"time"
 
@@ -21,6 +20,12 @@ import (
 
 // Gossip is the interface of the gossip component
 type Gossip interface {
+
+	// SelfMembershipInfo returns the peer's membership information
+	SelfMembershipInfo() discovery.NetworkMember
+
+	// SelfChannelInfo returns the peer's latest StateInfo message of a given channel
+	SelfChannelInfo(common.ChainID) *proto.SignedGossipMessage
 
 	// Send sends a message to remote peers
 	Send(msg *proto.GossipMessage, peers ...*comm.RemotePeer)
@@ -39,9 +44,13 @@ type Gossip interface {
 	// the peer publishes to other peers
 	UpdateMetadata(metadata []byte)
 
-	// UpdateChannelMetadata updates the self metadata the peer
-	// publishes to other peers about its channel-related state
-	UpdateChannelMetadata(metadata []byte, chainID common.ChainID)
+	// UpdateLedgerHeight updates the ledger height the peer
+	// publishes to other peers in the channel
+	UpdateLedgerHeight(height uint64, chainID common.ChainID)
+
+	// UpdateChaincodes updates the chaincodes the peer publishes
+	// to other peers in the channel
+	UpdateChaincodes(chaincode []*proto.Chaincode, chainID common.ChainID)
 
 	// Gossip sends a message to other peers to the network
 	Gossip(msg *proto.GossipMessage)
@@ -69,8 +78,18 @@ type Gossip interface {
 	// any connections to peers with identities that are found invalid
 	SuspectPeers(s api.PeerSuspector)
 
+	// IdentityInfo returns information known peer identities
+	IdentityInfo() api.PeerIdentitySet
+
 	// Stop stops the gossip component
 	Stop()
+}
+
+// emittedGossipMessage encapsulates signed gossip message to compose
+// with routing filter to be used while message is forwarded
+type emittedGossipMessage struct {
+	*proto.SignedGossipMessage
+	filter func(id common.PKIidType) bool
 }
 
 // SendCriteria defines how to send a specific message
@@ -106,11 +125,30 @@ type Config struct {
 
 	SkipBlockVerification bool // Should we skip verifying block messages or not
 
-	PublishCertPeriod        time.Duration    // Time from startup certificates are included in Alive messages
-	PublishStateInfoInterval time.Duration    // Determines frequency of pushing state info messages to peers
-	RequestStateInfoInterval time.Duration    // Determines frequency of pulling state info messages from peers
-	TLSServerCert            *tls.Certificate // TLS certificate of the peer
+	PublishCertPeriod        time.Duration // Time from startup certificates are included in Alive messages
+	PublishStateInfoInterval time.Duration // Determines frequency of pushing state info messages to peers
+	RequestStateInfoInterval time.Duration // Determines frequency of pulling state info messages from peers
 
-	InternalEndpoint string // Endpoint we publish to peers in our organization
-	ExternalEndpoint string // Peer publishes this endpoint instead of SelfEndpoint to foreign organizations
+	TLSCerts *common.TLSCertificates // TLS certificates of the peer
+
+	InternalEndpoint         string        // Endpoint we publish to peers in our organization
+	ExternalEndpoint         string        // Peer publishes this endpoint instead of SelfEndpoint to foreign organizations
+	TimeForMembershipTracker time.Duration // Determines time for polling with membershipTracker
+
+	DigestWaitTime   time.Duration // Time to wait before pull engine processes incoming digests
+	RequestWaitTime  time.Duration // Time to wait before pull engine removes incoming nonce
+	ResponseWaitTime time.Duration // Time to wait before pull engine ends pull
+
+	DialTimeout  time.Duration // Dial timeout
+	ConnTimeout  time.Duration // Connection timeout
+	RecvBuffSize int           // Buffer size of received messages
+	SendBuffSize int           // Buffer size of sending messages
+
+	MsgExpirationTimeout time.Duration // Leadership message expiration timeout
+
+	AliveTimeInterval            time.Duration // Alive check interval
+	AliveExpirationTimeout       time.Duration // Alive expiration timeout
+	AliveExpirationCheckInterval time.Duration // Alive expiration check interval
+	ReconnectInterval            time.Duration // Reconnect interval
+
 }

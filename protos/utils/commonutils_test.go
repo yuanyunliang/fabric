@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package utils
@@ -71,6 +61,54 @@ func TestUnmarshalPayload(t *testing.T) {
 		_ = UnmarshalPayloadOrPanic(bad)
 	}, "Expected panic unmarshaling malformed payload")
 
+}
+
+func TestUnmarshalSignatureHeader(t *testing.T) {
+	t.Run("invalid header", func(t *testing.T) {
+		sighdrBytes := []byte("invalid signature header")
+		sighdr, err := UnmarshalSignatureHeader(sighdrBytes)
+		assert.Error(t, err, "Expected unmarshaling error")
+		assert.Nil(t, sighdr)
+	})
+
+	t.Run("valid empty header", func(t *testing.T) {
+		sighdr := &cb.SignatureHeader{}
+		sighdrBytes := MarshalOrPanic(sighdr)
+		sighdr, err := UnmarshalSignatureHeader(sighdrBytes)
+		assert.NoError(t, err, "Unexpected error unmarshaling signature header")
+		assert.Nil(t, sighdr.Creator)
+		assert.Nil(t, sighdr.Nonce)
+	})
+
+	t.Run("valid header", func(t *testing.T) {
+		sighdr := &cb.SignatureHeader{
+			Creator: []byte("creator"),
+			Nonce:   []byte("nonce"),
+		}
+		sighdrBytes := MarshalOrPanic(sighdr)
+		sighdr, err := UnmarshalSignatureHeader(sighdrBytes)
+		assert.NoError(t, err, "Unexpected error unmarshaling signature header")
+		assert.Equal(t, []byte("creator"), sighdr.Creator)
+		assert.Equal(t, []byte("nonce"), sighdr.Nonce)
+	})
+}
+
+func TestUnmarshalSignatureHeaderOrPanic(t *testing.T) {
+
+	t.Run("panic due to invalid header", func(t *testing.T) {
+		sighdrBytes := []byte("invalid signature header")
+		assert.Panics(t, func() {
+			UnmarshalSignatureHeaderOrPanic(sighdrBytes)
+		}, "Expected panic with invalid header")
+	})
+
+	t.Run("no panic as the header is valid", func(t *testing.T) {
+		sighdr := &cb.SignatureHeader{}
+		sighdrBytes := MarshalOrPanic(sighdr)
+		sighdr = UnmarshalSignatureHeaderOrPanic(sighdrBytes)
+		assert.Nil(t, sighdr.Creator)
+		assert.Nil(t, sighdr.Nonce)
+	})
 }
 
 func TestUnmarshalEnvelope(t *testing.T) {
@@ -261,7 +299,6 @@ func TestNewSignatureHeaderOrPanic(t *testing.T) {
 	assert.Panics(t, func() {
 		_ = NewSignatureHeaderOrPanic(badSigner)
 	}, "Expected panic with signature header error")
-
 }
 
 func TestSignOrPanic(t *testing.T) {
@@ -357,4 +394,83 @@ func TestChannelHeader(t *testing.T) {
 
 	_, err = ChannelHeader(&cb.Envelope{})
 	assert.Error(t, err, "Payload was missing")
+}
+
+func TestIsConfigBlock(t *testing.T) {
+	newBlock := func(env *cb.Envelope) *cb.Block {
+		return &cb.Block{
+			Data: &cb.BlockData{
+				Data: [][]byte{MarshalOrPanic(env)},
+			},
+		}
+	}
+
+	newConfigEnv := func(envType int32) *cb.Envelope {
+		return &cb.Envelope{
+			Payload: MarshalOrPanic(&cb.Payload{
+				Header: &cb.Header{
+					ChannelHeader: MarshalOrPanic(&cb.ChannelHeader{
+						Type:      envType,
+						ChannelId: "test-chain",
+					}),
+				},
+				Data: []byte("test bytes"),
+			}), // common.Payload
+		} // LastUpdate
+	}
+
+	// scenario 1: CONFIG envelope
+	envType := int32(cb.HeaderType_CONFIG)
+	env := newConfigEnv(envType)
+	block := newBlock(env)
+
+	result := IsConfigBlock(block)
+	assert.True(t, result, "IsConfigBlock returns true for blocks with CONFIG envelope")
+
+	// scenario 2: ORDERER_TRANSACTION envelope
+	envType = int32(cb.HeaderType_ORDERER_TRANSACTION)
+	env = newConfigEnv(envType)
+	block = newBlock(env)
+
+	result = IsConfigBlock(block)
+	assert.True(t, result, "IsConfigBlock returns true for blocks with ORDERER_TRANSACTION envelope")
+
+	// scenario 3: MESSAGE envelope
+	envType = int32(cb.HeaderType_MESSAGE)
+	env = newConfigEnv(envType)
+	block = newBlock(env)
+
+	result = IsConfigBlock(block)
+	assert.False(t, result, "IsConfigBlock returns false for blocks with MESSAGE envelope")
+}
+
+func TestEnvelopeToConfigUpdate(t *testing.T) {
+
+	makeEnv := func(data []byte) *cb.Envelope {
+		return &cb.Envelope{
+			Payload: MarshalOrPanic(&cb.Payload{
+				Header: &cb.Header{
+					ChannelHeader: MarshalOrPanic(&cb.ChannelHeader{
+						Type:      int32(cb.HeaderType_CONFIG_UPDATE),
+						ChannelId: "test-chain",
+					}),
+				},
+				Data: data,
+			}), // common.Payload
+		} // LastUpdate
+	}
+
+	// scenario 1: for valid envelopes
+	configUpdateEnv := &cb.ConfigUpdateEnvelope{}
+	env := makeEnv(MarshalOrPanic(configUpdateEnv))
+	result, err := EnvelopeToConfigUpdate(env)
+
+	assert.NoError(t, err, "EnvelopeToConfigUpdate runs without error for valid CONFIG_UPDATE envelope")
+	assert.Equal(t, configUpdateEnv, result, "Correct configUpdateEnvelope returned")
+
+	// scenario 2: for invalid envelopes
+	env = makeEnv([]byte("test bytes"))
+	_, err = EnvelopeToConfigUpdate(env)
+
+	assert.Error(t, err, "EnvelopeToConfigUpdate fails with error for invalid CONFIG_UPDATE envelope")
 }

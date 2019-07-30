@@ -9,6 +9,7 @@ package msgprocessor
 import (
 	"fmt"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/common/crypto"
@@ -16,7 +17,7 @@ import (
 	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protos/utils"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
 // ChannelConfigTemplator can be used to generate config templates.
@@ -41,15 +42,15 @@ func NewSystemChannel(support StandardChannelSupport, templator ChannelConfigTem
 }
 
 // CreateSystemChannelFilters creates the set of filters for the ordering system chain.
+//
+// In maintenance mode, require the signature of /Channel/Orderer/Writers. This will filter out configuration
+// changes that are not related to consensus-type migration (e.g on /Channel/Application).
 func CreateSystemChannelFilters(chainCreator ChainCreator, ledgerResources channelconfig.Resources) *RuleSet {
-	ordererConfig, ok := ledgerResources.OrdererConfig()
-	if !ok {
-		logger.Panicf("Cannot create system channel filters without orderer config")
-	}
 	return NewRuleSet([]Rule{
 		EmptyRejectRule,
-		NewSizeFilter(ordererConfig),
-		NewSigFilter(policies.ChannelWriters, ledgerResources),
+		NewExpirationRejectRule(ledgerResources),
+		NewSizeFilter(ledgerResources),
+		NewSigFilter(policies.ChannelWriters, policies.ChannelOrdererWriters, ledgerResources),
 		NewSystemChannelFilter(ledgerResources, chainCreator),
 	})
 }
@@ -101,7 +102,7 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 
 	newChannelConfigEnv, err := bundle.ConfigtxValidator().ProposeConfigUpdate(envConfigUpdate)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, errors.WithMessage(err, fmt.Sprintf("error validating channel creation transaction for new channel '%s', could not succesfully apply update to template configuration", channelID))
 	}
 
 	newChannelEnvConfig, err := utils.CreateSignedEnvelope(cb.HeaderType_CONFIG, channelID, s.support.Signer(), newChannelConfigEnv, msgVersion, epoch)
@@ -118,7 +119,7 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 	// just constructed is not too large for our consenter.  It additionally reapplies the signature
 	// check, which although not strictly necessary, is a good sanity check, in case the orderer
 	// has not been configured with the right cert material.  The additional overhead of the signature
-	// check is negligable, as this is the channel creation path and not the normal path.
+	// check is negligible, as this is the channel creation path and not the normal path.
 	err = s.StandardChannel.filters.Apply(wrappedOrdererTransaction)
 	if err != nil {
 		return nil, 0, err
@@ -293,7 +294,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 			if !ok {
 				return nil, fmt.Errorf("Attempted to include a member which is not in the consortium")
 			}
-			applicationGroup.Groups[orgName] = consortiumGroup
+			applicationGroup.Groups[orgName] = proto.Clone(consortiumGroup).(*cb.ConfigGroup)
 		}
 	}
 
@@ -301,7 +302,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 
 	// Copy the system channel Channel level config to the new config
 	for key, value := range systemChannelGroup.Values {
-		channelGroup.Values[key] = value
+		channelGroup.Values[key] = proto.Clone(value).(*cb.ConfigValue)
 		if key == channelconfig.ConsortiumKey {
 			// Do not set the consortium name, we do this later
 			continue
@@ -309,11 +310,11 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 	}
 
 	for key, policy := range systemChannelGroup.Policies {
-		channelGroup.Policies[key] = policy
+		channelGroup.Policies[key] = proto.Clone(policy).(*cb.ConfigPolicy)
 	}
 
 	// Set the new config orderer group to the system channel orderer group and the application group to the new application group
-	channelGroup.Groups[channelconfig.OrdererGroupKey] = systemChannelGroup.Groups[channelconfig.OrdererGroupKey]
+	channelGroup.Groups[channelconfig.OrdererGroupKey] = proto.Clone(systemChannelGroup.Groups[channelconfig.OrdererGroupKey]).(*cb.ConfigGroup)
 	channelGroup.Groups[channelconfig.ApplicationGroupKey] = applicationGroup
 	channelGroup.Values[channelconfig.ConsortiumKey] = &cb.ConfigValue{
 		Value:     utils.MarshalOrPanic(channelconfig.ConsortiumValue(consortium.Name).Value()),
@@ -322,8 +323,9 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 
 	// Non-backwards compatible bugfix introduced in v1.1
 	// The capability check should be removed once v1.0 is deprecated
-	if oc, ok := dt.support.OrdererConfig(); ok && oc.Capabilities().SetChannelModPolicyDuringCreate() {
+	if oc, ok := dt.support.OrdererConfig(); ok && oc.Capabilities().PredictableChannelTemplate() {
 		channelGroup.ModPolicy = systemChannelGroup.ModPolicy
+		zeroVersions(channelGroup)
 	}
 
 	bundle, err := channelconfig.NewBundle(channelHeader.ChannelId, &cb.Config{
@@ -335,4 +337,21 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 	}
 
 	return bundle, nil
+}
+
+// zeroVersions recursively iterates over a config tree, setting all versions to zero
+func zeroVersions(cg *cb.ConfigGroup) {
+	cg.Version = 0
+
+	for _, value := range cg.Values {
+		value.Version = 0
+	}
+
+	for _, policy := range cg.Policies {
+		policy.Version = 0
+	}
+
+	for _, group := range cg.Groups {
+		zeroVersions(group)
+	}
 }

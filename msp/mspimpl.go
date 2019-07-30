@@ -28,6 +28,9 @@ type mspSetupFuncType func(config *m.FabricMSPConfig) error
 // validateIdentityOUsFuncType is the prototype of the function to validate identity's OUs
 type validateIdentityOUsFuncType func(id *identity) error
 
+// satisfiesPrincipalInternalFuncType is the prototype of the function to check if principals are satisfied
+type satisfiesPrincipalInternalFuncType func(id Identity, principal *m.MSPPrincipal) error
+
 // This is an instantiation of an MSP that
 // uses BCCSP for its cryptographic primitives.
 type bccspmsp struct {
@@ -40,6 +43,9 @@ type bccspmsp struct {
 
 	// internalValidateIdentityOusFunc is the pointer to the function to validate identity's OUs
 	internalValidateIdentityOusFunc validateIdentityOUsFuncType
+
+	// internalSatisfiesPrincipalInternalFunc is the pointer to the function to check if principals are satisfied
+	internalSatisfiesPrincipalInternalFunc satisfiesPrincipalInternalFuncType
 
 	// list of CA certs we trust
 	rootCerts []Identity
@@ -87,7 +93,7 @@ type bccspmsp struct {
 	ouEnforcement bool
 	// These are the OUIdentifiers of the clients, peers and orderers.
 	// They are used to tell apart these entities
-	clientOU, peerOU, ordererOU *OUIdentifier
+	clientOU, peerOU *OUIdentifier
 }
 
 // newBccspMsp returns an MSP instance backed up by a BCCSP
@@ -105,9 +111,15 @@ func newBccspMsp(version MSPVersion) (MSP, error) {
 	case MSPv1_0:
 		theMsp.internalSetupFunc = theMsp.setupV1
 		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV1
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalPreV13
 	case MSPv1_1:
 		theMsp.internalSetupFunc = theMsp.setupV11
 		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV11
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalPreV13
+	case MSPv1_3:
+		theMsp.internalSetupFunc = theMsp.setupV11
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV11
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalV13
 	default:
 		return nil, errors.Errorf("Invalid MSP version [%v]", version)
 	}
@@ -276,10 +288,53 @@ func (msp *bccspmsp) Validate(id Identity) error {
 	}
 }
 
+// hasOURole checks that the identity belongs to the organizational unit
+// associated to the specified MSPRole.
+// This function does not check the certifiers identifier.
+// Appropriate validation needs to be enforced before.
+func (msp *bccspmsp) hasOURole(id Identity, mspRole m.MSPRole_MSPRoleType) error {
+	// Check NodeOUs
+	if !msp.ouEnforcement {
+		return errors.New("NodeOUs not activated. Cannot tell apart identities.")
+	}
+
+	mspLogger.Debugf("MSP %s checking if the identity is a client", msp.name)
+
+	switch id := id.(type) {
+	// If this identity is of this specific type,
+	// this is how I can validate it given the
+	// root of trust this MSP has
+	case *identity:
+		return msp.hasOURoleInternal(id, mspRole)
+	default:
+		return errors.New("Identity type not recognized")
+	}
+}
+
+func (msp *bccspmsp) hasOURoleInternal(id *identity, mspRole m.MSPRole_MSPRoleType) error {
+	var nodeOUValue string
+	switch mspRole {
+	case m.MSPRole_CLIENT:
+		nodeOUValue = msp.clientOU.OrganizationalUnitIdentifier
+	case m.MSPRole_PEER:
+		nodeOUValue = msp.peerOU.OrganizationalUnitIdentifier
+	default:
+		return fmt.Errorf("Invalid MSPRoleType. It must be CLIENT, PEER or ORDERER")
+	}
+
+	for _, OU := range id.GetOrganizationalUnits() {
+		if OU.OrganizationalUnitIdentifier == nodeOUValue {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("The identity does not contain OU [%s], MSP: [%s]", mspRole, msp.name)
+}
+
 // DeserializeIdentity returns an Identity given the byte-level
 // representation of a SerializedIdentity struct
 func (msp *bccspmsp) DeserializeIdentity(serializedID []byte) (Identity, error) {
-	mspLogger.Infof("Obtaining identity")
+	mspLogger.Debug("Obtaining identity")
 
 	// We first deserialize to a SerializedIdentity to get the MSP ID
 	sId := &m.SerializedIdentity{}
@@ -324,6 +379,58 @@ func (msp *bccspmsp) deserializeIdentityInternal(serializedIdentity []byte) (Ide
 
 // SatisfiesPrincipal returns null if the identity matches the principal or an error otherwise
 func (msp *bccspmsp) SatisfiesPrincipal(id Identity, principal *m.MSPPrincipal) error {
+	principals, err := collectPrincipals(principal, msp.GetVersion())
+	if err != nil {
+		return err
+	}
+	for _, principal := range principals {
+		err = msp.internalSatisfiesPrincipalInternalFunc(id, principal)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectPrincipals collects principals from combined principals into a single MSPPrincipal slice.
+func collectPrincipals(principal *m.MSPPrincipal, mspVersion MSPVersion) ([]*m.MSPPrincipal, error) {
+	switch principal.PrincipalClassification {
+	case m.MSPPrincipal_COMBINED:
+		// Combined principals are not supported in MSP v1.0 or v1.1
+		if mspVersion <= MSPv1_1 {
+			return nil, errors.Errorf("invalid principal type %d", int32(principal.PrincipalClassification))
+		}
+		// Principal is a combination of multiple principals.
+		principals := &m.CombinedPrincipal{}
+		err := proto.Unmarshal(principal.Principal, principals)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not unmarshal CombinedPrincipal from principal")
+		}
+		// Return an error if there are no principals in the combined principal.
+		if len(principals.Principals) == 0 {
+			return nil, errors.New("No principals in CombinedPrincipal")
+		}
+		// Recursively call msp.collectPrincipals for all combined principals.
+		// There is no limit for the levels of nesting for the combined principals.
+		var principalsSlice []*m.MSPPrincipal
+		for _, cp := range principals.Principals {
+			internalSlice, err := collectPrincipals(cp, mspVersion)
+			if err != nil {
+				return nil, err
+			}
+			principalsSlice = append(principalsSlice, internalSlice...)
+		}
+		// All the combined principals have been collected into principalsSlice
+		return principalsSlice, nil
+	default:
+		return []*m.MSPPrincipal{principal}, nil
+	}
+}
+
+// satisfiesPrincipalInternalPreV13 takes as arguments the identity and the principal.
+// The function returns an error if one occurred.
+// The function implements the behavior of an MSP up to and including v1.1.
+func (msp *bccspmsp) satisfiesPrincipalInternalPreV13(id Identity, principal *m.MSPPrincipal) error {
 	switch principal.PrincipalClassification {
 	// in this case, we have to check whether the
 	// identity has a role in the msp - member or admin
@@ -360,8 +467,19 @@ func (msp *bccspmsp) SatisfiesPrincipal(id Identity, principal *m.MSPPrincipal) 
 					return nil
 				}
 			}
-
 			return errors.New("This identity is not an admin")
+		case m.MSPRole_CLIENT:
+			fallthrough
+		case m.MSPRole_PEER:
+			mspLogger.Debugf("Checking if identity satisfies role [%s] for %s", m.MSPRole_MSPRoleType_name[int32(mspRole.Role)], msp.name)
+			if err := msp.Validate(id); err != nil {
+				return errors.Wrapf(err, "The identity is not valid under this MSP [%s]", msp.name)
+			}
+
+			if err := msp.hasOURole(id, mspRole.Role); err != nil {
+				return errors.Wrapf(err, "The identity is not a [%s] under this MSP [%s]", m.MSPRole_MSPRoleType_name[int32(mspRole.Role)], msp.name)
+			}
+			return nil
 		default:
 			return errors.Errorf("invalid MSP role type %d", int32(mspRole.Role))
 		}
@@ -414,6 +532,35 @@ func (msp *bccspmsp) SatisfiesPrincipal(id Identity, principal *m.MSPPrincipal) 
 	}
 }
 
+// satisfiesPrincipalInternalV13 takes as arguments the identity and the principal.
+// The function returns an error if one occurred.
+// The function implements the additional behavior expected of an MSP starting from v1.3.
+// For pre-v1.3 functionality, the function calls the satisfiesPrincipalInternalPreV13.
+func (msp *bccspmsp) satisfiesPrincipalInternalV13(id Identity, principal *m.MSPPrincipal) error {
+	switch principal.PrincipalClassification {
+	case m.MSPPrincipal_COMBINED:
+		return errors.New("SatisfiesPrincipalInternal shall not be called with a CombinedPrincipal")
+	case m.MSPPrincipal_ANONYMITY:
+		anon := &m.MSPIdentityAnonymity{}
+		err := proto.Unmarshal(principal.Principal, anon)
+		if err != nil {
+			return errors.Wrap(err, "could not unmarshal MSPIdentityAnonymity from principal")
+		}
+		switch anon.AnonymityType {
+		case m.MSPIdentityAnonymity_ANONYMOUS:
+			return errors.New("Principal is anonymous, but X.509 MSP does not support anonymous identities")
+		case m.MSPIdentityAnonymity_NOMINAL:
+			return nil
+		default:
+			return errors.Errorf("Unknown principal anonymity type: %d", anon.AnonymityType)
+		}
+
+	default:
+		// Use the pre-v1.3 function to check other principal types
+		return msp.satisfiesPrincipalInternalPreV13(id, principal)
+	}
+}
+
 // getCertificationChain returns the certification chain of the passed identity within this msp
 func (msp *bccspmsp) getCertificationChain(id Identity) ([]*x509.Certificate, error) {
 	mspLogger.Debugf("MSP %s getting certification chain", msp.name)
@@ -442,7 +589,8 @@ func (msp *bccspmsp) getCertificationChainForBCCSPIdentity(id *identity) ([]*x50
 
 	// CAs cannot be directly used as identities..
 	if id.cert.IsCA {
-		return nil, errors.New("A CA certificate cannot be used directly by this MSP")
+		return nil, errors.New("An X509 certificate with Basic Constraint: " +
+			"Certificate Authority equals true cannot be used as an identity")
 	}
 
 	return msp.getValidationChain(id.cert, false)
@@ -529,30 +677,21 @@ func (msp *bccspmsp) sanitizeCert(cert *x509.Certificate) (*x509.Certificate, er
 	if isECDSASignedCert(cert) {
 		// Lookup for a parent certificate to perform the sanitization
 		var parentCert *x509.Certificate
-		if cert.IsCA {
-			// at this point, cert might be a root CA certificate
-			// or an intermediate CA certificate
-			chain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
-			if err != nil {
-				return nil, err
-			}
-			if len(chain) == 1 {
-				// cert is a root CA certificate
-				parentCert = cert
-			} else {
-				// cert is an intermediate CA certificate
-				parentCert = chain[1]
-			}
+		chain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
+		if err != nil {
+			return nil, err
+		}
+
+		// at this point, cert might be a root CA certificate
+		// or an intermediate CA certificate
+		if cert.IsCA && len(chain) == 1 {
+			// cert is a root CA certificate
+			parentCert = cert
 		} else {
-			chain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
-			if err != nil {
-				return nil, err
-			}
 			parentCert = chain[1]
 		}
 
 		// Sanitize
-		var err error
 		cert, err = sanitizeECDSASignedCert(cert, parentCert)
 		if err != nil {
 			return nil, err

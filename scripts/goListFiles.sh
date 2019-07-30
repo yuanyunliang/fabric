@@ -7,13 +7,13 @@
 
 
 find_golang_src() {
-    find $1 -name "*.go" -or -name "*.h" -or -name "*.c"
+    find $1 -name "*.go" -or -name "*.h" -or -name "*.c" -or -name "*.s"
 }
 
 list_deps() {
     target=$1
 
-    deps=`go list -f '{{ join .Deps "\n" }}' $target`
+    deps=`go list -f '{{ join .Deps "\n" }}' $target/...`
 
     find_golang_src $GOPATH/src/$target
 

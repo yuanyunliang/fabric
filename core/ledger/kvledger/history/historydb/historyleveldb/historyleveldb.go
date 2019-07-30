@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package historyleveldb
@@ -30,10 +20,20 @@ import (
 	putils "github.com/hyperledger/fabric/protos/utils"
 )
 
-var logger = flogging.MustGetLogger("historyleveldb")
+var logger historydbLogger = flogging.MustGetLogger("historyleveldb")
 
 var savePointKey = []byte{0x00}
 var emptyValue = []byte{}
+
+//go:generate counterfeiter -o fakes/historydb_logger.go -fake-name HistorydbLogger . historydbLogger
+
+// historydbLogger defines the interface for historyleveldb logging. The purpose is to allow unit tests to use a fake logger.
+type historydbLogger interface {
+	Debugf(template string, args ...interface{})
+	Errorf(template string, args ...interface{})
+	Infof(template string, args ...interface{})
+	Warnf(template string, args ...interface{})
+}
 
 // HistoryDBProvider implements interface HistoryDBProvider
 type HistoryDBProvider struct {
@@ -94,11 +94,6 @@ func (historyDB *historyDB) Commit(block *common.Block) error {
 
 	// Get the invalidation byte array for the block
 	txsFilter := util.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
-	// Initialize txsFilter if it does not yet exist (e.g. during testing, for genesis block, etc)
-	if len(txsFilter) == 0 {
-		txsFilter = util.NewTxValidationFlags(len(block.Data.Data))
-		block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = txsFilter
-	}
 
 	// write each tran's write set to history db
 	for _, envBytes := range block.Data.Data {
@@ -189,7 +184,10 @@ func (historyDB *historyDB) GetLastSavepoint() (*version.Height, error) {
 	if err != nil || versionBytes == nil {
 		return nil, err
 	}
-	height, _ := version.NewHeightFromBytes(versionBytes)
+	height, _, err := version.NewHeightFromBytes(versionBytes)
+	if err != nil {
+		return nil, err
+	}
 	return height, nil
 }
 
@@ -211,6 +209,14 @@ func (historyDB *historyDB) ShouldRecover(lastAvailableBlock uint64) (bool, uint
 // CommitLostBlock implements method in interface kvledger.Recoverer
 func (historyDB *historyDB) CommitLostBlock(blockAndPvtdata *ledger.BlockAndPvtData) error {
 	block := blockAndPvtdata.Block
+
+	// log every 1000th block at Info level so that history rebuild progress can be tracked in production envs.
+	if block.Header.Number%1000 == 0 {
+		logger.Infof("Recommitting block [%d] to history database", block.Header.Number)
+	} else {
+		logger.Debugf("Recommitting block [%d] to history database", block.Header.Number)
+	}
+
 	if err := historyDB.Commit(block); err != nil {
 		return err
 	}

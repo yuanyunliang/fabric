@@ -23,20 +23,18 @@ import (
 	cb "github.com/hyperledger/fabric/protos/common"
 	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
-
-	logging "github.com/op/go-logging"
 	"github.com/pkg/errors"
 )
 
 var exitCode = 0
 
-var logger = flogging.MustGetLogger("common/tools/configtxgen")
+var logger = flogging.MustGetLogger("common.tools.configtxgen")
 
 func doOutputBlock(config *genesisconfig.Profile, channelID string, outputBlock string) error {
 	pgen := encoder.New(config)
 	logger.Info("Generating genesis block")
 	if config.Orderer == nil {
-		return fmt.Errorf("config does not contain an Orderers section, necessary for all config blocks, aborting")
+		return errors.Errorf("refusing to generate block which is missing orderer section")
 	}
 	if config.Consortiums == nil {
 		logger.Warning("Genesis block does not contain a consortiums group definition.  This block cannot be used for orderer bootstrap.")
@@ -50,28 +48,20 @@ func doOutputBlock(config *genesisconfig.Profile, channelID string, outputBlock 
 	return nil
 }
 
-func doOutputChannelCreateTx(conf *genesisconfig.Profile, channelID string, outputChannelCreateTx string) error {
+func doOutputChannelCreateTx(conf, baseProfile *genesisconfig.Profile, channelID string, outputChannelCreateTx string) error {
 	logger.Info("Generating new channel configtx")
 
-	if conf.Application == nil {
-		return fmt.Errorf("Cannot define a new channel with no Application section")
+	var configtx *cb.Envelope
+	var err error
+	if baseProfile == nil {
+		configtx, err = encoder.MakeChannelCreationTransaction(channelID, nil, conf)
+	} else {
+		configtx, err = encoder.MakeChannelCreationTransactionWithSystemChannelContext(channelID, nil, conf, baseProfile)
 	}
-
-	if conf.Consortium == "" {
-		return fmt.Errorf("Cannot define a new channel with no Consortium value")
-	}
-
-	// XXX we ignore the non-application org names here, once the tool supports configuration updates
-	// we should come up with a cleaner way to handle this, but leaving as is for the moment to not break
-	// backwards compatibility
-	var orgNames []string
-	for _, org := range conf.Application.Organizations {
-		orgNames = append(orgNames, org.Name)
-	}
-	configtx, err := encoder.MakeChannelCreationTransaction(channelID, conf.Consortium, nil, nil, orgNames...)
 	if err != nil {
-		return fmt.Errorf("Error generating configtx: %s", err)
+		return err
 	}
+
 	logger.Info("Writing new channel tx")
 	err = ioutil.WriteFile(outputChannelCreateTx, utils.MarshalOrPanic(configtx), 0644)
 	if err != nil {
@@ -208,7 +198,7 @@ func doInspectChannelCreateTx(inspectChannelCreateTx string) error {
 func doPrintOrg(t *genesisconfig.TopLevel, printOrg string) error {
 	for _, org := range t.Organizations {
 		if org.Name == printOrg {
-			og, err := encoder.NewOrdererOrgGroup(org)
+			og, err := encoder.NewConsortiumOrgGroup(org)
 			if err != nil {
 				return errors.Wrapf(err, "bad org definition for org %s", org.Name)
 			}
@@ -223,12 +213,14 @@ func doPrintOrg(t *genesisconfig.TopLevel, printOrg string) error {
 }
 
 func main() {
-	var outputBlock, outputChannelCreateTx, profile, channelID, inspectBlock, inspectChannelCreateTx, outputAnchorPeersUpdate, asOrg, printOrg string
+	var outputBlock, outputChannelCreateTx, channelCreateTxBaseProfile, profile, configPath, channelID, inspectBlock, inspectChannelCreateTx, outputAnchorPeersUpdate, asOrg, printOrg string
 
 	flag.StringVar(&outputBlock, "outputBlock", "", "The path to write the genesis block to (if set)")
-	flag.StringVar(&channelID, "channelID", genesisconfig.TestChainID, "The channel ID to use in the configtx")
+	flag.StringVar(&channelID, "channelID", "", "The channel ID to use in the configtx")
 	flag.StringVar(&outputChannelCreateTx, "outputCreateChannelTx", "", "The path to write a channel creation configtx to (if set)")
+	flag.StringVar(&channelCreateTxBaseProfile, "channelCreateTxBaseProfile", "", "Specifies a profile to consider as the orderer system channel current state to allow modification of non-application parameters during channel create tx generation. Only valid in conjuction with 'outputCreateChannelTx'.")
 	flag.StringVar(&profile, "profile", genesisconfig.SampleInsecureSoloProfile, "The profile from configtx.yaml to use for generation.")
+	flag.StringVar(&configPath, "configPath", "", "The path containing the configuration to use (if set)")
 	flag.StringVar(&inspectBlock, "inspectBlock", "", "Prints the configuration contained in the block at the specified path")
 	flag.StringVar(&inspectChannelCreateTx, "inspectChannelCreateTx", "", "Prints the configuration contained in the transaction at the specified path")
 	flag.StringVar(&outputAnchorPeersUpdate, "outputAnchorPeersUpdate", "", "Creates an config update to update an anchor peer (works only with the default channel creation, and only for the first update)")
@@ -239,23 +231,33 @@ func main() {
 
 	flag.Parse()
 
+	if channelID == "" && (outputBlock != "" || outputChannelCreateTx != "" || outputAnchorPeersUpdate != "") {
+		channelID = genesisconfig.TestChainID
+		logger.Warningf("Omitting the channel ID for configtxgen for output operations is deprecated.  Explicitly passing the channel ID will be required in the future, defaulting to '%s'.", channelID)
+	}
+
 	// show version
 	if *version {
 		printVersion()
 		os.Exit(exitCode)
 	}
 
-	logging.SetLevel(logging.INFO, "")
-
 	// don't need to panic when running via command line
 	defer func() {
 		if err := recover(); err != nil {
 			if strings.Contains(fmt.Sprint(err), "Error reading configuration: Unsupported Config Type") {
 				logger.Error("Could not find configtx.yaml. " +
-					"Please make sure that FABRIC_CFG_PATH is set to a path " +
+					"Please make sure that FABRIC_CFG_PATH or -configPath is set to a path " +
 					"which contains configtx.yaml")
+				os.Exit(1)
 			}
-			os.Exit(1)
+			if strings.Contains(fmt.Sprint(err), "Could not find profile") {
+				logger.Error(fmt.Sprint(err) + ". " +
+					"Please make sure that FABRIC_CFG_PATH or -configPath is set to a path " +
+					"which contains configtx.yaml with the specified profile")
+				os.Exit(1)
+			}
+			logger.Panic(err)
 		}
 	}()
 
@@ -263,10 +265,30 @@ func main() {
 	factory.InitFactories(nil)
 	var profileConfig *genesisconfig.Profile
 	if outputBlock != "" || outputChannelCreateTx != "" || outputAnchorPeersUpdate != "" {
-		profileConfig = genesisconfig.Load(profile)
+		if configPath != "" {
+			profileConfig = genesisconfig.Load(profile, configPath)
+		} else {
+			profileConfig = genesisconfig.Load(profile)
+		}
+	}
+	var topLevelConfig *genesisconfig.TopLevel
+	if configPath != "" {
+		topLevelConfig = genesisconfig.LoadTopLevel(configPath)
+	} else {
+		topLevelConfig = genesisconfig.LoadTopLevel()
 	}
 
-	topLevelConfig := genesisconfig.LoadTopLevel()
+	var baseProfile *genesisconfig.Profile
+	if channelCreateTxBaseProfile != "" {
+		if outputChannelCreateTx == "" {
+			logger.Warning("Specified 'channelCreateTxBaseProfile', but did not specify 'outputChannelCreateTx', 'channelCreateTxBaseProfile' will not affect output.")
+		}
+		if configPath != "" {
+			baseProfile = genesisconfig.Load(channelCreateTxBaseProfile, configPath)
+		} else {
+			baseProfile = genesisconfig.Load(channelCreateTxBaseProfile)
+		}
+	}
 
 	if outputBlock != "" {
 		if err := doOutputBlock(profileConfig, channelID, outputBlock); err != nil {
@@ -275,7 +297,7 @@ func main() {
 	}
 
 	if outputChannelCreateTx != "" {
-		if err := doOutputChannelCreateTx(profileConfig, channelID, outputChannelCreateTx); err != nil {
+		if err := doOutputChannelCreateTx(profileConfig, baseProfile, channelID, outputChannelCreateTx); err != nil {
 			logger.Fatalf("Error on outputChannelCreateTx: %s", err)
 		}
 	}

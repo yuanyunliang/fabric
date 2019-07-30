@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package testutil
@@ -27,6 +17,7 @@ import (
 	pb "github.com/hyperledger/fabric/protos/peer"
 	ptestutils "github.com/hyperledger/fabric/protos/testutils"
 	"github.com/hyperledger/fabric/protos/utils"
+	"github.com/stretchr/testify/assert"
 )
 
 //BlockGenerator generates a series of blocks for testing
@@ -37,11 +28,23 @@ type BlockGenerator struct {
 	t            *testing.T
 }
 
+type TxDetails struct {
+	TxID                            string
+	ChaincodeName, ChaincodeVersion string
+	SimulationResults               []byte
+}
+
+type BlockDetails struct {
+	BlockNum     uint64
+	PreviousHash []byte
+	Txs          []*TxDetails
+}
+
 // NewBlockGenerator instantiates new BlockGenerator for testing
 func NewBlockGenerator(t *testing.T, ledgerID string, signTxs bool) (*BlockGenerator, *common.Block) {
 	gb, err := test.MakeGenesisBlock(ledgerID)
-	AssertNoError(t, err, "")
-	gb.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = lutils.NewTxValidationFlags(len(gb.Data.Data))
+	assert.NoError(t, err)
+	gb.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = lutils.NewTxValidationFlagsSetValue(len(gb.Data.Data), pb.TxValidationCode_VALID)
 	return &BlockGenerator{1, gb.GetHeader().Hash(), signTxs, t}, gb
 }
 
@@ -53,7 +56,7 @@ func (bg *BlockGenerator) NextBlock(simulationResults [][]byte) *common.Block {
 	return block
 }
 
-// NextBlock constructs next block in sequence that includes a number of transactions - one per simulationResults
+// NextBlockWithTxid constructs next block in sequence that includes a number of transactions - one per simulationResults
 func (bg *BlockGenerator) NextBlockWithTxid(simulationResults [][]byte, txids []string) *common.Block {
 	// Length of simulationResults should be same as the length of txids.
 	if len(simulationResults) != len(txids) {
@@ -77,28 +80,54 @@ func (bg *BlockGenerator) NextTestBlock(numTx int, txSize int) *common.Block {
 // NextTestBlocks constructs 'numBlocks' number of blocks for testing
 func (bg *BlockGenerator) NextTestBlocks(numBlocks int) []*common.Block {
 	blocks := []*common.Block{}
+	numTx := 10
 	for i := 0; i < numBlocks; i++ {
-		blocks = append(blocks, bg.NextTestBlock(10, 100))
+		block := bg.NextTestBlock(numTx, 100)
+		block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = lutils.NewTxValidationFlagsSetValue(numTx, pb.TxValidationCode_VALID)
+		blocks = append(blocks, block)
 	}
 	return blocks
 }
 
 // ConstructTransaction constructs a transaction for testing
 func ConstructTransaction(_ *testing.T, simulationResults []byte, txid string, sign bool) (*common.Envelope, string, error) {
+	return ConstructTransactionFromTxDetails(
+		&TxDetails{
+			ChaincodeName:     "foo",
+			ChaincodeVersion:  "v1",
+			TxID:              txid,
+			SimulationResults: simulationResults,
+		},
+		sign,
+	)
+}
+
+func ConstructTransactionFromTxDetails(txDetails *TxDetails, sign bool) (*common.Envelope, string, error) {
 	ccid := &pb.ChaincodeID{
-		Name:    "foo",
-		Version: "v1",
+		Name:    txDetails.ChaincodeName,
+		Version: txDetails.ChaincodeVersion,
 	}
-	//response := &pb.Response{Status: 200}
-	var txID string
 	var txEnv *common.Envelope
 	var err error
+	var txID string
 	if sign {
-		txEnv, txID, err = ptestutils.ConstructSingedTxEnvWithDefaultSigner(util.GetTestChainID(), ccid, nil, simulationResults, txid, nil, nil)
+		txEnv, txID, err = ptestutils.ConstructSignedTxEnvWithDefaultSigner(util.GetTestChainID(), ccid, nil, txDetails.SimulationResults, txDetails.TxID, nil, nil)
 	} else {
-		txEnv, txID, err = ptestutils.ConstructUnsignedTxEnv(util.GetTestChainID(), ccid, nil, simulationResults, txid, nil, nil)
+		txEnv, txID, err = ptestutils.ConstructUnsignedTxEnv(util.GetTestChainID(), ccid, nil, txDetails.SimulationResults, txDetails.TxID, nil, nil)
 	}
 	return txEnv, txID, err
+}
+
+func ConstructBlockFromBlockDetails(t *testing.T, blockDetails *BlockDetails, sign bool) *common.Block {
+	var envs []*common.Envelope
+	for _, txDetails := range blockDetails.Txs {
+		env, _, err := ConstructTransactionFromTxDetails(txDetails, sign)
+		if err != nil {
+			t.Fatalf("ConstructTestTransaction failed, err %s", err)
+		}
+		envs = append(envs, env)
+	}
+	return NewBlock(envs, blockDetails.BlockNum, blockDetails.PreviousHash)
 }
 
 func ConstructBlockWithTxid(t *testing.T, blockNum uint64, previousHash []byte, simulationResults [][]byte, txids []string, sign bool) *common.Block {
@@ -137,6 +166,7 @@ func ConstructTestBlock(t *testing.T, blockNum uint64, numTx int, txSize int) *c
 
 // ConstructTestBlocks returns a series of blocks starting with blockNum=0.
 // The first block in the returned array is a config tx block that represents a genesis block
+// Except the genesis block, the size of each of the block would be the same.
 func ConstructTestBlocks(t *testing.T, numBlocks int) []*common.Block {
 	bg, gb := NewBlockGenerator(t, util.GetTestChainID(), false)
 	blocks := []*common.Block{}
@@ -164,7 +194,43 @@ func NewBlock(env []*common.Envelope, blockNum uint64, previousHash []byte) *com
 	block.Header.DataHash = block.Data.Hash()
 	utils.InitBlockMetadata(block)
 
-	block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = lutils.NewTxValidationFlags(len(env))
+	block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = lutils.NewTxValidationFlagsSetValue(len(env), pb.TxValidationCode_VALID)
 
 	return block
+}
+
+func SetTxID(t *testing.T, block *common.Block, txNum int, txID string) {
+	envelopeBytes := block.Data.Data[txNum]
+	envelope, err := utils.UnmarshalEnvelope(envelopeBytes)
+	if err != nil {
+		t.Fatalf("error unmarshaling envelope: %s", err)
+	}
+
+	payload, err := utils.GetPayload(envelope)
+	if err != nil {
+		t.Fatalf("error getting payload from envelope: %s", err)
+	}
+
+	channelHeader, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+	if err != nil {
+		t.Fatalf("error unmarshaling channel header: %s", err)
+	}
+	channelHeader.TxId = txID
+	channelHeaderBytes, err := proto.Marshal(channelHeader)
+	if err != nil {
+		t.Fatalf("error marshaling channel header: %s", err)
+	}
+	payload.Header.ChannelHeader = channelHeaderBytes
+
+	payloadBytes, err := proto.Marshal(payload)
+	if err != nil {
+		t.Fatalf("error marshaling payload: %s", err)
+	}
+
+	envelope.Payload = payloadBytes
+	envelopeBytes, err = proto.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("error marshaling envelope: %s", err)
+	}
+	block.Data.Data[txNum] = envelopeBytes
 }

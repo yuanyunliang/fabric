@@ -7,6 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 package viperutil
 
 import (
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -16,12 +18,11 @@ import (
 	"strings"
 	"time"
 
-	"encoding/json"
-	"encoding/pem"
-
 	"github.com/Shopify/sarama"
+	version "github.com/hashicorp/go-version"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/mitchellh/mapstructure"
+	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 )
 
@@ -29,10 +30,31 @@ var logger = flogging.MustGetLogger("viperutil")
 
 type viperGetter func(key string) interface{}
 
-func getKeysRecursively(base string, getKey viperGetter, nodeKeys map[string]interface{}) map[string]interface{} {
+func getKeysRecursively(base string, getKey viperGetter, nodeKeys map[string]interface{}, oType reflect.Type) map[string]interface{} {
+	subTypes := map[string]reflect.Type{}
+
+	if oType != nil && oType.Kind() == reflect.Struct {
+	outer:
+		for i := 0; i < oType.NumField(); i++ {
+			fieldName := oType.Field(i).Name
+			fieldType := oType.Field(i).Type
+
+			for key := range nodeKeys {
+				if strings.EqualFold(fieldName, key) {
+					subTypes[key] = fieldType
+					continue outer
+				}
+			}
+
+			subTypes[fieldName] = fieldType
+			nodeKeys[fieldName] = nil
+		}
+	}
+
 	result := make(map[string]interface{})
 	for key := range nodeKeys {
 		fqKey := base + key
+
 		val := getKey(fqKey)
 		if m, ok := val.(map[interface{}]interface{}); ok {
 			logger.Debugf("Found map[interface{}]interface{} value for %s", fqKey)
@@ -44,10 +66,10 @@ func getKeysRecursively(base string, getKey viperGetter, nodeKeys map[string]int
 				}
 				tmp[cik] = iv
 			}
-			result[key] = getKeysRecursively(fqKey+".", getKey, tmp)
+			result[key] = getKeysRecursively(fqKey+".", getKey, tmp, subTypes[key])
 		} else if m, ok := val.(map[string]interface{}); ok {
 			logger.Debugf("Found map[string]interface{} value for %s", fqKey)
-			result[key] = getKeysRecursively(fqKey+".", getKey, m)
+			result[key] = getKeysRecursively(fqKey+".", getKey, m, subTypes[key])
 		} else if m, ok := unmarshalJSON(val); ok {
 			logger.Debugf("Found real value for %s setting to map[string]string %v", fqKey, m)
 			result[key] = m
@@ -245,33 +267,41 @@ func pemBlocksFromFileDecodeHook() mapstructure.DecodeHookFunc {
 	}
 }
 
+var kafkaVersionConstraints map[sarama.KafkaVersion]version.Constraints
+
+func init() {
+	kafkaVersionConstraints = make(map[sarama.KafkaVersion]version.Constraints)
+	kafkaVersionConstraints[sarama.V0_8_2_0], _ = version.NewConstraint(">=0.8.2,<0.8.2.1")
+	kafkaVersionConstraints[sarama.V0_8_2_1], _ = version.NewConstraint(">=0.8.2.1,<0.8.2.2")
+	kafkaVersionConstraints[sarama.V0_8_2_2], _ = version.NewConstraint(">=0.8.2.2,<0.9.0.0")
+	kafkaVersionConstraints[sarama.V0_9_0_0], _ = version.NewConstraint(">=0.9.0.0,<0.9.0.1")
+	kafkaVersionConstraints[sarama.V0_9_0_1], _ = version.NewConstraint(">=0.9.0.1,<0.10.0.0")
+	kafkaVersionConstraints[sarama.V0_10_0_0], _ = version.NewConstraint(">=0.10.0.0,<0.10.0.1")
+	kafkaVersionConstraints[sarama.V0_10_0_1], _ = version.NewConstraint(">=0.10.0.1,<0.10.1.0")
+	kafkaVersionConstraints[sarama.V0_10_1_0], _ = version.NewConstraint(">=0.10.1.0,<0.10.2.0")
+	kafkaVersionConstraints[sarama.V0_10_2_0], _ = version.NewConstraint(">=0.10.2.0,<0.11.0.0")
+	kafkaVersionConstraints[sarama.V0_11_0_0], _ = version.NewConstraint(">=0.11.0.0,<1.0.0")
+	kafkaVersionConstraints[sarama.V1_0_0_0], _ = version.NewConstraint(">=1.0.0")
+}
+
 func kafkaVersionDecodeHook() mapstructure.DecodeHookFunc {
 	return func(f reflect.Type, t reflect.Type, data interface{}) (interface{}, error) {
 		if f.Kind() != reflect.String || t != reflect.TypeOf(sarama.KafkaVersion{}) {
 			return data, nil
 		}
-		switch data {
-		case "0.8.2.0":
-			return sarama.V0_8_2_0, nil
-		case "0.8.2.1":
-			return sarama.V0_8_2_1, nil
-		case "0.8.2.2":
-			return sarama.V0_8_2_2, nil
-		case "0.9.0.0":
-			return sarama.V0_9_0_0, nil
-		case "0.9.0.1":
-			return sarama.V0_9_0_1, nil
-		case "0.10.0.0":
-			return sarama.V0_10_0_0, nil
-		case "0.10.0.1":
-			return sarama.V0_10_0_1, nil
-		case "0.10.1.0":
-			return sarama.V0_10_1_0, nil
-		case "0.10.2.0":
-			return sarama.V0_10_2_0, nil
-		default:
-			return nil, fmt.Errorf("Unsupported Kafka version: '%s'", data)
+
+		v, err := version.NewVersion(data.(string))
+		if err != nil {
+			return nil, fmt.Errorf("Unable to parse Kafka version: %s", err)
 		}
+
+		for kafkaVersion, constraints := range kafkaVersionConstraints {
+			if constraints.Check(v) {
+				return kafkaVersion, nil
+			}
+		}
+
+		return nil, fmt.Errorf("Unsupported Kafka version: '%s'", data)
 	}
 }
 
@@ -279,10 +309,19 @@ func kafkaVersionDecodeHook() mapstructure.DecodeHookFunc {
 // producing error when extraneous variables are introduced and supporting
 // the time.Duration type
 func EnhancedExactUnmarshal(v *viper.Viper, output interface{}) error {
-	// AllKeys doesn't actually return all keys, it only returns the base ones
+	oType := reflect.TypeOf(output)
+	if oType.Kind() != reflect.Ptr {
+		return errors.Errorf("supplied output argument must be a pointer to a struct but is not pointer")
+	}
+	eType := oType.Elem()
+	if eType.Kind() != reflect.Struct {
+		return errors.Errorf("supplied output argument must be a pointer to a struct, but it is pointer to something else")
+	}
+
 	baseKeys := v.AllSettings()
+
 	getterWithClass := func(key string) interface{} { return v.Get(key) } // hide receiver
-	leafKeys := getKeysRecursively("", getterWithClass, baseKeys)
+	leafKeys := getKeysRecursively("", getterWithClass, baseKeys, eType)
 
 	logger.Debugf("%+v", leafKeys)
 	config := &mapstructure.DecoderConfig{
@@ -310,7 +349,7 @@ func EnhancedExactUnmarshal(v *viper.Viper, output interface{}) error {
 func EnhancedExactUnmarshalKey(baseKey string, output interface{}) error {
 	m := make(map[string]interface{})
 	m[baseKey] = nil
-	leafKeys := getKeysRecursively("", viper.Get, m)
+	leafKeys := getKeysRecursively("", viper.Get, m, nil)
 
 	logger.Debugf("%+v", leafKeys)
 
@@ -326,4 +365,9 @@ func EnhancedExactUnmarshalKey(baseKey string, output interface{}) error {
 	}
 
 	return decoder.Decode(leafKeys[baseKey])
+}
+
+// Decode is used to decode opaque field in configuration
+func Decode(input interface{}, output interface{}) error {
+	return mapstructure.Decode(input, output)
 }

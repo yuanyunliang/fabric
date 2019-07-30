@@ -11,10 +11,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/bccsp"
 	m "github.com/hyperledger/fabric/protos/msp"
-	"github.com/pkg/errors"
+	errors "github.com/pkg/errors"
 )
 
 func (msp *bccspmsp) getCertifiersIdentifier(certRaw []byte) ([]byte, error) {
@@ -157,17 +159,6 @@ func (msp *bccspmsp) setupCAs(conf *m.FabricMSPConfig) error {
 		msp.opts.Intermediates.AddCert(id.(*identity).cert)
 	}
 
-	// make and fill the set of admin certs (if present)
-	msp.admins = make([]Identity, len(conf.Admins))
-	for i, admCert := range conf.Admins {
-		id, _, err := msp.getIdentityFromConf(admCert)
-		if err != nil {
-			return err
-		}
-
-		msp.admins[i] = id
-	}
-
 	return nil
 }
 
@@ -206,11 +197,14 @@ func (msp *bccspmsp) setupCRLs(conf *m.FabricMSPConfig) error {
 	return nil
 }
 
-func (msp *bccspmsp) finalizeSetupCAs(config *m.FabricMSPConfig) error {
+func (msp *bccspmsp) finalizeSetupCAs() error {
 	// ensure that our CAs are properly formed and that they are valid
 	for _, id := range append(append([]Identity{}, msp.rootCerts...), msp.intermediateCerts...) {
-		if !isCACert(id.(*identity).cert) {
-			return errors.Errorf("CA Certificate did not have the Subject Key Identifier extension, (SN: %s)", id.(*identity).cert.SerialNumber)
+		if !id.(*identity).cert.IsCA {
+			return errors.Errorf("CA Certificate did not have the CA attribute, (SN: %x)", id.(*identity).cert.SerialNumber)
+		}
+		if _, err := getSubjectKeyIdentifierFromCert(id.(*identity).cert); err != nil {
+			return errors.WithMessage(err, fmt.Sprintf("CA Certificate problem with Subject Key Identifier extension, (SN: %x)", id.(*identity).cert.SerialNumber))
 		}
 
 		if err := msp.validateCAIdentity(id.(*identity)); err != nil {
@@ -237,14 +231,14 @@ func (msp *bccspmsp) finalizeSetupCAs(config *m.FabricMSPConfig) error {
 }
 
 func (msp *bccspmsp) setupNodeOUs(config *m.FabricMSPConfig) error {
-	if config.FabricNodeOUs != nil {
+	if config.FabricNodeOus != nil {
 
-		msp.ouEnforcement = config.FabricNodeOUs.Enable
+		msp.ouEnforcement = config.FabricNodeOus.Enable
 
 		// ClientOU
-		msp.clientOU = &OUIdentifier{OrganizationalUnitIdentifier: config.FabricNodeOUs.ClientOUIdentifier.OrganizationalUnitIdentifier}
-		if len(config.FabricNodeOUs.ClientOUIdentifier.Certificate) != 0 {
-			certifiersIdentifier, err := msp.getCertifiersIdentifier(config.FabricNodeOUs.ClientOUIdentifier.Certificate)
+		msp.clientOU = &OUIdentifier{OrganizationalUnitIdentifier: config.FabricNodeOus.ClientOuIdentifier.OrganizationalUnitIdentifier}
+		if len(config.FabricNodeOus.ClientOuIdentifier.Certificate) != 0 {
+			certifiersIdentifier, err := msp.getCertifiersIdentifier(config.FabricNodeOus.ClientOuIdentifier.Certificate)
 			if err != nil {
 				return err
 			}
@@ -252,24 +246,15 @@ func (msp *bccspmsp) setupNodeOUs(config *m.FabricMSPConfig) error {
 		}
 
 		// PeerOU
-		msp.peerOU = &OUIdentifier{OrganizationalUnitIdentifier: config.FabricNodeOUs.PeerOUIdentifier.OrganizationalUnitIdentifier}
-		if len(config.FabricNodeOUs.PeerOUIdentifier.Certificate) != 0 {
-			certifiersIdentifier, err := msp.getCertifiersIdentifier(config.FabricNodeOUs.PeerOUIdentifier.Certificate)
+		msp.peerOU = &OUIdentifier{OrganizationalUnitIdentifier: config.FabricNodeOus.PeerOuIdentifier.OrganizationalUnitIdentifier}
+		if len(config.FabricNodeOus.PeerOuIdentifier.Certificate) != 0 {
+			certifiersIdentifier, err := msp.getCertifiersIdentifier(config.FabricNodeOus.PeerOuIdentifier.Certificate)
 			if err != nil {
 				return err
 			}
 			msp.peerOU.CertifiersIdentifier = certifiersIdentifier
 		}
 
-		// OrdererOU
-		msp.ordererOU = &OUIdentifier{OrganizationalUnitIdentifier: config.FabricNodeOUs.OrdererOUIdentifier.OrganizationalUnitIdentifier}
-		if len(config.FabricNodeOUs.OrdererOUIdentifier.Certificate) != 0 {
-			certifiersIdentifier, err := msp.getCertifiersIdentifier(config.FabricNodeOUs.OrdererOUIdentifier.Certificate)
-			if err != nil {
-				return err
-			}
-			msp.ordererOU.CertifiersIdentifier = certifiersIdentifier
-		}
 	} else {
 		msp.ouEnforcement = false
 	}
@@ -282,6 +267,16 @@ func (msp *bccspmsp) setupSigningIdentity(conf *m.FabricMSPConfig) error {
 		sid, err := msp.getSigningIdentityFromConf(conf.SigningIdentity)
 		if err != nil {
 			return err
+		}
+
+		expirationTime := sid.ExpiresAt()
+		now := time.Now()
+		if expirationTime.After(now) {
+			mspLogger.Debug("Signing identity expires at", expirationTime)
+		} else if expirationTime.IsZero() {
+			mspLogger.Debug("Signing identity has no known expiration time")
+		} else {
+			return errors.Errorf("signing identity expired %v ago", now.Sub(expirationTime))
 		}
 
 		msp.signer = sid
@@ -359,8 +354,11 @@ func (msp *bccspmsp) setupTLSCAs(conf *m.FabricMSPConfig) error {
 			continue
 		}
 
-		if !isCACert(cert) {
-			return errors.Errorf("CA Certificate did not have the Subject Key Identifier extension, (SN: %s)", cert.SerialNumber)
+		if !cert.IsCA {
+			return errors.Errorf("CA Certificate did not have the CA attribute, (SN: %x)", cert.SerialNumber)
+		}
+		if _, err := getSubjectKeyIdentifierFromCert(cert); err != nil {
+			return errors.WithMessage(err, fmt.Sprintf("CA Certificate problem with Subject Key Identifier extension, (SN: %x)", cert.SerialNumber))
 		}
 
 		if err := msp.validateTLSCAIdentity(cert, opts); err != nil {
@@ -407,7 +405,7 @@ func (msp *bccspmsp) preSetupV1(conf *m.FabricMSPConfig) error {
 	}
 
 	// Finalize setup of the CAs
-	if err := msp.finalizeSetupCAs(conf); err != nil {
+	if err := msp.finalizeSetupCAs(); err != nil {
 		return err
 	}
 
@@ -454,9 +452,34 @@ func (msp *bccspmsp) setupV11(conf *m.FabricMSPConfig) error {
 		return err
 	}
 
-	err = msp.postSetupV1(conf)
+	err = msp.postSetupV11(conf)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (msp *bccspmsp) postSetupV11(conf *m.FabricMSPConfig) error {
+	// Check for OU enforcement
+	if !msp.ouEnforcement {
+		// No enforcement required. Call post setup as per V1
+		return msp.postSetupV1(conf)
+	}
+
+	// Check that admins are clients
+	principalBytes, err := proto.Marshal(&m.MSPRole{Role: m.MSPRole_CLIENT, MspIdentifier: msp.name})
+	if err != nil {
+		return errors.Wrapf(err, "failed creating MSPRole_CLIENT")
+	}
+	principal := &m.MSPPrincipal{
+		PrincipalClassification: m.MSPPrincipal_ROLE,
+		Principal:               principalBytes}
+	for i, admin := range msp.admins {
+		err = admin.SatisfiesPrincipal(principal)
+		if err != nil {
+			return errors.WithMessage(err, fmt.Sprintf("admin %d is invalid", i))
+		}
 	}
 
 	return nil
